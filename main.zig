@@ -1,38 +1,111 @@
 const std = @import("std");
-const Code = std.ArrayList(u8);
-const base_point: u64 = 0x400000;
+pub const base_point: u64 = 0x200000;
+const prologue_len = 10;
+
+const Code = @import("Code.zig");
 
 const number_sections: u16 = 5;
 pub fn cast(i: anytype) [@sizeOf(@TypeOf(i))]u8 {
     return @bitCast([@sizeOf(@TypeOf(i))]u8, i);
 }
+const help =
+    \\bz - brainfuck to elf compiler in zig
+    \\Usage:
+    \\bz [file]
+    \\options:
+    \\-o [file to output] (default "a.out")
+    \\-h, --help | show this help text
+    \\-b [size of brainfuck array] (default 30_000)
+    \\
+;
 
 pub fn main() !void {
     var general_pa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = general_pa.deinit();
     const gpa = &general_pa.allocator;
-    var dat = Code.init(gpa);
+    var output: ?[]const u8 = null;
+    var input: ?[]const u8 = null;
+    var bss_size: ?u32 = null;
+    {
+        var i: usize = 1;
+        const argv = std.os.argv;
+        while (i < argv.len) : (i += 1) {
+            const arg = argv[i];
+            if (std.mem.eql(u8, std.mem.spanZ(arg), "-o")) {
+                if (output != null)
+                    fatal("cannot have -o more than once");
+                if (i + 1 == argv.len)
+                    fatal("expected another argument after -o");
+                i += 1;
+                output = std.mem.spanZ(argv[i]);
+            } else if (std.mem.eql(u8, std.mem.spanZ(arg), "-h") or std.mem.eql(u8, std.mem.spanZ(arg), "--help")) {
+                const stdout = std.io.getStdOut();
+                try stdout.writeAll(help);
+                std.process.exit(0);
+            } else if (std.mem.eql(u8, std.mem.spanZ(arg), "-b")) {
+                if (bss_size != null)
+                    fatal("cannot have -b more than once");
+                if (i + 1 == argv.len)
+                    fatal("expected another argument after -b");
+                i += 1;
+                bss_size = std.fmt.parseUnsigned(u32, std.mem.spanZ(argv[i]), 10) catch {
+                    fatal("unable to parse argument after -b");
+                };
+            } else {
+                if (input != null)
+                    fatal("cannot have more than 1 input file");
+                input = std.mem.spanZ(argv[i]);
+            }
+        }
+        if (input == null) {
+            fatal("need one input file\n" ++ help);
+        }
+    }
+    const bfcode = try std.fs.cwd().readFileAlloc(gpa, input.?, std.math.maxInt(usize));
+    defer gpa.free(bfcode);
+    try genElfAndWriteToFs(gpa, bfcode, .{ .output_name = output });
+}
+
+fn fatal(comptime msg: []const u8) noreturn {
+    std.log.emerg(msg, .{});
+    std.process.exit(1);
+}
+
+const ElfOpts = struct {
+    bss_len: u16 = 30_000,
+    output_name: ?[]const u8,
+};
+fn genElfAndWriteToFs(gpa: *std.mem.Allocator, bfcode: []const u8, opts: ElfOpts) !void {
+    var dat = std.ArrayList(u8).init(gpa);
     defer dat.deinit();
 
     // === the code
-    const machinecode = [_]u8{ 0xb8, 0xe7, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x3c, 0x25, 0x87, 0x00, 0x40, 0x00, 0x0f, 0x05, 0x0 };
-    const data = "Hello World";
+    const genned = try Code.gen(gpa, bfcode);
+    defer genned.deinit(gpa);
+    const data = "";
     const shstrtab = "\x00.text\x00.data\x00.shstrtab\x00.bss\x00";
-    const bss_len = 0xdeadbeef;
 
-    const c = machinecode ++ data ++ shstrtab;
+    const genned_len = prologue_len + genned.output.len;
+    // zeros are for the prologue after we figure out the spacing
+    const c = try std.mem.concat(gpa, u8, &.{ &[_]u8{0} ** prologue_len, genned.output, data, shstrtab });
+    defer gpa.free(c);
 
     // === our elf linking
     const header_off = getSize(ElfHeader) + getSize(ProgHeader);
     const entry_off = base_point + header_off;
-    const machinecode_o = header_off;
-    const data_o = header_off + machinecode.len;
+    const genned_o = header_off;
+    const data_o = header_off + genned_len;
     const shstrtab_o = data_o + data.len;
     const bss_o = shstrtab_o + shstrtab.len;
     const sections_off = header_off + c.len;
     const sh_size = number_sections * getSize(SectionHeader);
     const sh_off = sections_off + sh_size;
     const filesize = sh_off;
+    {
+        // doing some ad-hoc relocations for the prologue
+        std.mem.copy(u8, c[0..2], &.{ 0x49, 0xba });
+        std.mem.copy(u8, c[2..prologue_len], &cast(bss_o + base_point));
+    }
 
     // ELF HEADER
     try writeTypeToCode(&dat, ElfHeader, .{
@@ -73,9 +146,9 @@ pub fn main() !void {
         .sh_name = cast(@truncate(u32, text_off)),
         .sh_type = cast(SHT_PROGBITS),
         .sh_flags = cast(@as(u64, 0)),
-        .sh_addr = cast(@as(u64, base_point + machinecode_o)),
-        .sh_offset = cast(@as(u64, machinecode_o)),
-        .sh_size = cast(@as(u64, machinecode.len)),
+        .sh_addr = cast(@as(u64, base_point + genned_o)),
+        .sh_offset = cast(@as(u64, genned_o)),
+        .sh_size = cast(@as(u64, genned_len)),
         .sh_link = cast(@as(u32, 0)),
         .sh_info = cast(@as(u32, 0)),
         .sh_addralign = cast(@as(u64, 0)),
@@ -118,7 +191,7 @@ pub fn main() !void {
         .sh_flags = cast(@as(u64, 0)),
         .sh_addr = cast(@as(u64, base_point + bss_o)),
         .sh_offset = cast(@as(u64, bss_o)),
-        .sh_size = cast(@as(u64, bss_len)),
+        .sh_size = cast(@as(u64, opts.bss_len)),
         .sh_link = cast(@as(u32, 0)),
         .sh_info = cast(@as(u32, 0)),
         .sh_addralign = cast(@as(u64, 0)),
@@ -127,14 +200,16 @@ pub fn main() !void {
 
     // === write to filesystem
 
-    const file = try std.fs.cwd().createFile("code", .{
+    var name: []const u8 = "a.out";
+    if (opts.output_name) |n| name = n;
+    const file = try std.fs.cwd().createFile(name, .{
         .mode = 0o777,
     });
     defer file.close();
     _ = try file.write(dat.items);
 }
 
-fn writeTypeToCode(c: *Code, comptime T: type, s: T) !void {
+fn writeTypeToCode(c: *std.ArrayList(u8), comptime T: type, s: T) !void {
     inline for (std.meta.fields(T)) |f| {
         switch (f.field_type) {
             u8 => try c.append(@field(s, f.name)),

@@ -1,4 +1,4 @@
-# A rudimentary attempt at an elf linker
+# An attempt at an elf linker
 
 This is meant to be a simple learning project.
 
